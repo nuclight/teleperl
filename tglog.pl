@@ -10,7 +10,10 @@ use AnyEvent;
 use Telegram;
 use Telegram::Messages::GetDialogs;
 use Telegram::Messages::GetHistory;
+use Telegram::Channels::GetMessages;
 use Telegram::InputPeer;
+use Telegram::InputChannel;
+use Telegram::InputMessage;
 
 use DBIx::Class;
 use Teleblog::Schema;
@@ -33,6 +36,8 @@ my $schema = Teleblog::Schema->connect(
 		quote_names => 1,
 		mysql_enable_utf8 => 1,
 });
+
+my %timers;
 
 sub handle_update
 {
@@ -63,19 +68,37 @@ sub handle_update
         #say Dumper $upd;
         my $mesg = $upd->{message};
         utf8::decode($mesg);
-        $schema->resultset('Message')->find_or_create({
+        #my $m = $schema->resultset('Message')->find($peer->{id});
+        #$schema->resultset('Chat')->create({
+        #    id => $peer->{id},
+        #    title => $peer->{title},
+        #    username => $peer->{username}
+        #}) unless $chat;
+        my $dbm = $schema->resultset('Message')->search({
+                id => $upd->{id},
+                from_id => $from,
+                to_id => $to,
+            }, 
+	    { rows => 1 }
+        )->single;
+        $schema->resultset('Message')->create({
             id => $upd->{id},
             from_id => $from,
             to_id => $to,
             message => $mesg,
+            reply_to => $upd->{reply_to_msg_id},
+            via_bot_id => $upd->{via_bot_id},
+            flags => $upd->{flags},
             date => DateTime->from_epoch(epoch => $upd->{date})
-        }, key => 'msg_id');
+        }) unless $dbm;
     }
 }
 
 sub handle_history
 {
     my ($tg, $ipeer, $first_id, $last_id, $deep, $ms) = @_;
+
+    my $is_end = 0;
 
     if ($ms->isa('Telegram::Messages::ChannelMessages')) {
         my $top_m = 0;
@@ -88,12 +111,13 @@ sub handle_history
                     first_name => $u->{first_name},
                     last_name => $u->{last_name},
                     username => $u->{username}
-	    	}) unless $user;
+                }) unless $user;
             }
         }
         for my $m (@{$ms->{messages}}) {
             if ($m->isa('Telegram::Message')) {
                 $top_m = $m->{id};
+		$is_end = 1 if $first_id == $m->{id};
                 my $to = $m->{to_id};
                 my $from = $m->{from_id};
                 if ($to) {
@@ -108,17 +132,30 @@ sub handle_history
                 say "id: $m->{id}";
                 my $mesg = $m->{message};
                 utf8::decode($mesg);
-                $schema->resultset('Message')->find_or_create({
+                
+		my $dbm = $schema->resultset('Message')->search({
+                    id => $m->{id},
+                    from_id => $from,
+                    to_id => $to,
+                }, { rows => 1 } )->single;
+		$schema->resultset('Message')->create({
                     id => $m->{id},
                     from_id => $from,
                     to_id => $to,
                     message => $mesg,
+                    reply_to => $m->{reply_to_msg_id},
+                    via_bot_id => $m->{via_bot_id},
+                    flags => $m->{flags},
                     date => DateTime->from_epoch(epoch => $m->{date})
-                }, key => 'msg_id');
+                }) unless $dbm;
             }
+	    elsif (exists $m->{id}) {
+                $top_m = $m->{id};
+		$is_end = 1 if $first_id == $m->{id};
+	    }
         }
         if ($deep) {
-	    if ($top_m != $first_id) {
+	    unless ($is_end) {
                 $tg->invoke( 
                     Telegram::Messages::GetHistory->new(
                         peer => $ipeer,
@@ -191,7 +228,8 @@ sub get_chan_history
             sub { handle_history($tg, $ipeer, $first_id, $last_id, 0, @_) } 
         );
     }
-    if ($deep_hist and $first_id) {
+    # XXX: magic numbers instead of proper handling of history end
+    if ($deep_hist and $first_id and $first_id > 9) {
         $tg->invoke( 
             Telegram::Messages::GetHistory->new(
                 peer => $ipeer,
@@ -204,6 +242,80 @@ sub get_chan_history
                 hash => 0
             ), 
             sub { handle_history($tg, $ipeer, $first_id, $last_id, 1, @_) } 
+        );
+    }
+}
+
+sub handle_messages
+{
+    my ($tg, $ipeer, $m_id, $chat_mesg, $messages) = @_;
+    
+    if ($messages->isa('Telegram::Messages::ChannelMessages')) {
+
+        for my $m (@{$messages->{messages}}) {
+            if ($m->isa('Telegram::Message')) {
+                my $to = $m->{to_id};
+                my $from = $m->{from_id};
+                if ($to) {
+                    if ($to->isa('Telegram::PeerChannel')) {
+                        $to = $to->{channel_id};
+                    }
+                    if ($to->isa('Telegram::PeerChat')) {
+                        $to = $to->{chat_id};
+                    }
+                }
+
+                say "id: $m->{id}";
+                my $mesg = $m->{message};
+                utf8::decode($mesg);
+                
+                $m_id->flags($m->{flags});
+                $m_id->reply_to($m->{reply_to_msg_id});
+                $m_id->via_bot_id($m->{via_bot_id});
+                $m_id->update;
+            }
+        }
+    }
+    $m_id = $chat_mesg->next;
+    if ($m_id) {
+        my $uid = $m_id->uid;
+        $timers{$uid} = AE::timer(10, 0, sub {
+                delete $timers{$uid};
+
+                $tg->invoke(
+                    Telegram::Channels::GetMessages->new(
+                        channel => Telegram::InputChannel->new( %$ipeer ),
+                        id => [
+                            Telegram::InputMessageID->new( id => $m_id->id )
+                            ]
+                    ),
+                    sub { handle_messages($tg, $ipeer, $m_id, $chat_mesg, @_) }
+                );
+        });
+    }
+}
+
+sub update_messages
+{
+    my ($tg, $ipeer) = @_;
+
+    my $chat_mesg = $schema->resultset('Message')->search(
+        {
+            to_id => $ipeer->{channel_id},
+            flags => -1
+        }, 
+        { columns => ['uid', 'id'] }
+    );
+    my $m = $chat_mesg->next;
+    if ($m) {
+        $tg->invoke(
+            Telegram::Channels::GetMessages->new(
+                channel => Telegram::InputChannel->new( %$ipeer ),
+                id => [
+                    Telegram::InputMessageID->new( id => $m->id )
+                    ]
+            ),
+            sub { handle_messages($tg, $ipeer, $m, $chat_mesg, @_) }
         );
     }
 }
@@ -248,8 +360,10 @@ sub handle_dialogs
                     id => $peer->{id},
                     title => $peer->{title},
                     username => $peer->{username}
-	    	}) unless $chat;
+                }) unless $chat;
+                
                 get_chan_history($tg, $ipeer, $d->{top_message});
+                update_messages($tg, $ipeer);
             }
             if ($peer->isa('Telegram::PeerChat')){
                 my $chat_id = $peer->{chat_id};
